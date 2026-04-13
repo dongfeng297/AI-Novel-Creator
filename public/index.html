@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Novel Workbench</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar" id="app-sidebar">
+        <div class="brand">
+          <div>
+            <p class="eyebrow">AI Novel</p>
+            <h1>小说创作工作台</h1>
+          </div>
+          <button id="toggle-sidebar-btn" class="secondary ghost-button" type="button">折叠</button>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>作品</h2>
+            <button id="new-project-btn" class="secondary">新建</button>
+          </div>
+          <div class="stack">
+            <input id="project-title-input" placeholder="作品名称" />
+            <textarea id="project-description-input" rows="3" placeholder="作品简介"></textarea>
+          </div>
+          <ul id="project-list" class="item-list"></ul>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>模型接入</h3>
+            <button id="save-model-settings-btn">保存模型配置</button>
+          </div>
+          <label>API Base URL</label>
+          <input id="model-base-url" placeholder="https://api.openai.com/v1" />
+          <label>模型名称</label>
+          <input id="model-name" placeholder="gpt-4.1-mini" />
+          <label>超时秒数</label>
+          <input id="model-timeout-seconds" type="number" min="15" step="15" placeholder="180" />
+          <label>API Token</label>
+          <input id="model-api-key" type="password" placeholder="输入 OpenAI 兼容接口 Token" />
+          <p id="model-settings-hint" class="muted">
+            Token 只保存在本地 `data/store.json`，状态栏不会回显明文。超时默认 180 秒。
+          </p>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="hero">
+          <div>
+            <p class="eyebrow">Single-user Local App</p>
+            <h2 id="project-title">请选择或创建作品</h2>
+            <p id="project-description" class="muted"></p>
+          </div>
+          <div class="status-box">
+            <p id="model-status">模型状态读取中...</p>
+          </div>
+        </header>
+
+        <div id="workspace" class="workspace hidden">
+          <div class="workbench">
+            <aside class="workbench-left">
+              <section class="panel column-panel">
+                <div class="panel-head">
+                  <h3>章节列表</h3>
+                  <button id="new-chapter-btn">新建章节</button>
+                </div>
+                <p class="muted">左侧用于切换章节，默认保持竖向浏览。</p>
+                <ul id="chapter-list" class="item-list"></ul>
+              </section>
+            </aside>
+
+            <section id="chapter-editor" class="panel workbench-center hidden">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Writing Workspace</p>
+                  <h3 id="chapter-editor-title">章节工作区</h3>
+                </div>
+              </div>
+
+              <label>章节标题</label>
+              <input id="chapter-title" placeholder="章节标题" />
+
+              <div class="hint-box">
+                <p id="chapter-hint">请选择一个章节后开始编辑或生成。</p>
+              </div>
+
+              <label>正文工作区</label>
+              <textarea id="chapter-body" class="body-workspace" rows="30" placeholder="生成后的正文会出现在这里，可继续编辑"></textarea>
+
+              <label>本章摘要</label>
+              <textarea id="chapter-summary" rows="6" placeholder="生成后的摘要会出现在这里"></textarea>
+            </section>
+
+            <aside class="workbench-right">
+              <section class="panel column-panel sticky-controls">
+                <div class="panel-head">
+                  <h3>章节控制</h3>
+                  <button id="generate-chapter-btn">生成</button>
+                </div>
+                <div class="actions">
+                  <button id="save-chapter-btn" class="secondary">保存章节</button>
+                  <button id="regenerate-chapter-btn">重新生成</button>
+                </div>
+              </section>
+
+              <details class="panel column-panel accordion-panel" open>
+                <summary>生成配置</summary>
+                <div class="accordion-body">
+                  <label>剧情描述</label>
+                  <textarea id="chapter-plot" rows="6" placeholder="本章剧情描述"></textarea>
+
+                  <label>角色关系 / 次要角色作用</label>
+                  <textarea id="chapter-relationships" rows="5" placeholder="角色关系"></textarea>
+
+                  <label>写作风格 / 要求</label>
+                  <textarea id="chapter-style-guide" rows="4" placeholder="写作风格/要求"></textarea>
+                </div>
+              </details>
+
+              <details class="panel column-panel accordion-panel" open>
+                <summary>角色卡选择</summary>
+                <div class="accordion-body">
+                  <div id="chapter-character-selector" class="checkbox-list sidebar-selector"></div>
+                </div>
+              </details>
+
+              <details class="panel column-panel accordion-panel">
+                <summary>词条卡选择</summary>
+                <div class="accordion-body">
+                  <div id="chapter-entry-selector" class="checkbox-list sidebar-selector"></div>
+                </div>
+              </details>
+
+              <details class="panel column-panel accordion-panel">
+                <summary>关联历史章节</summary>
+                <div class="accordion-body">
+                  <div id="chapter-related-selector" class="checkbox-list related-list sidebar-selector"></div>
+                </div>
+              </details>
+
+              <details class="panel column-panel accordion-panel">
+                <summary>世界观</summary>
+                <div class="accordion-body">
+                  <div class="panel-head inline-head">
+                    <span></span>
+                    <button id="save-world-btn">保存世界观</button>
+                  </div>
+                  <label>世界设定</label>
+                  <textarea id="world-setting" rows="5" placeholder="世界设定"></textarea>
+                  <label>核心设定</label>
+                  <textarea id="world-core-setting" rows="4" placeholder="核心设定"></textarea>
+                </div>
+              </details>
+
+              <details class="panel column-panel accordion-panel">
+                <summary>角色库</summary>
+                <div class="accordion-body">
+                  <div class="panel-head inline-head">
+                    <span></span>
+                    <button id="save-character-btn">保存角色</button>
+                  </div>
+                  <input id="character-name" placeholder="角色名称" />
+                  <input id="character-gender" placeholder="角色性别" />
+                  <textarea id="character-personality" rows="3" placeholder="角色性格"></textarea>
+                  <textarea id="character-related-info" rows="5" placeholder="角色相关信息"></textarea>
+                  <input id="character-id" type="hidden" />
+                  <ul id="character-list" class="item-list compact"></ul>
+                </div>
+              </details>
+
+              <details class="panel column-panel accordion-panel">
+                <summary>词条库</summary>
+                <div class="accordion-body">
+                  <div class="panel-head inline-head">
+                    <span></span>
+                    <button id="save-entry-btn">保存词条</button>
+                  </div>
+                  <input id="entry-name" placeholder="词条名称" />
+                  <textarea id="entry-related-info" rows="6" placeholder="词条相关信息"></textarea>
+                  <input id="entry-id" type="hidden" />
+                  <ul id="entry-list" class="item-list compact"></ul>
+                </div>
+              </details>
+            </aside>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

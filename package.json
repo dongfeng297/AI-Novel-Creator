@@ -1,0 +1,9 @@
+{
+  "name": "ai-novel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local AI-assisted novel writing workbench",
+  "scripts": {
+    "start": "python3 server.py"
+  }
+}
