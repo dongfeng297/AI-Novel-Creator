@@ -17,7 +17,6 @@ const elements = {
   modelStatus: document.querySelector("#model-status"),
   modelBaseUrl: document.querySelector("#model-base-url"),
   modelName: document.querySelector("#model-name"),
-  modelTimeoutSeconds: document.querySelector("#model-timeout-seconds"),
   modelApiKey: document.querySelector("#model-api-key"),
   modelSettingsHint: document.querySelector("#model-settings-hint"),
   saveModelSettingsBtn: document.querySelector("#save-model-settings-btn"),
@@ -64,7 +63,19 @@ async function api(path, options = {}) {
     ...options,
   });
 
-  const data = await response.json();
+  const rawText = await response.text();
+  let data = null;
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch (error) {
+      const snippet = rawText.trim().slice(0, 240) || "<empty response>";
+      throw new Error(`接口返回了非 JSON 内容：${snippet}`);
+    }
+  } else {
+    data = {};
+  }
+
   if (!response.ok) {
     throw new Error(data.detail || data.error || "Request failed");
   }
@@ -316,7 +327,7 @@ async function refreshProjects(preserveProjectId) {
 async function loadConfig() {
   state.config = await api("/api/config");
   elements.modelStatus.textContent = state.config.modelConfigured
-    ? `模型已配置：${state.config.model} · ${state.config.baseUrl} · 超时 ${state.config.timeoutSeconds}s`
+    ? `模型已配置：${state.config.model} · ${state.config.baseUrl} · 流式生成已启用`
     : "未配置模型，将使用本地回退草稿模式。";
 }
 
@@ -324,7 +335,6 @@ async function loadModelSettings() {
   const settings = await api("/api/settings/model");
   elements.modelBaseUrl.value = settings.baseUrl || "https://api.openai.com/v1";
   elements.modelName.value = settings.model || "gpt-4.1-mini";
-  elements.modelTimeoutSeconds.value = settings.timeoutSeconds || 180;
   elements.modelApiKey.value = "";
   elements.modelSettingsHint.textContent = settings.hasApiKey
     ? "当前已保存 Token。留空并保存会保留原 Token；输入新值并保存会覆盖。"
@@ -335,7 +345,6 @@ async function saveModelSettings() {
   const payload = {
     baseUrl: elements.modelBaseUrl.value.trim(),
     model: elements.modelName.value.trim(),
-    timeoutSeconds: Number(elements.modelTimeoutSeconds.value) || 180,
   };
   if (elements.modelApiKey.value.trim()) {
     payload.apiKey = elements.modelApiKey.value.trim();
@@ -496,11 +505,81 @@ async function generateChapter() {
   }
 
   await saveChapter();
-  elements.chapterHint.textContent = "正在生成正文与摘要...";
+  setGenerationState(true);
+  elements.chapterBody.value = "";
+  elements.chapterSummary.value = "";
+  elements.chapterHint.textContent = "正在建立流式连接...";
 
-  const result = await api(`/api/projects/${project.id}/chapters/${chapter.id}/generate`, {
+  const response = await fetch(`/api/projects/${project.id}/chapters/${chapter.id}/generate-stream`, {
     method: "POST",
   });
+  if (!response.ok) {
+    setGenerationState(false);
+    throw new Error(`生成请求失败：HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    setGenerationState(false);
+    throw new Error("浏览器未返回可读取的流。");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let result = null;
+  let streamError = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const messages = buffer.split("\n\n");
+    buffer = messages.pop() || "";
+    for (const message of messages) {
+      const parsed = parseSseMessage(message);
+      if (!parsed) {
+        continue;
+      }
+      if (parsed.event === "status") {
+        elements.chapterHint.textContent = parsed.data.message || "正在生成...";
+      } else if (parsed.event === "body_delta") {
+        elements.chapterBody.value += parsed.data.content || "";
+      } else if (parsed.event === "summary") {
+        elements.chapterSummary.value = parsed.data.summary || "";
+      } else if (parsed.event === "complete") {
+        result = parsed.data;
+      } else if (parsed.event === "error") {
+        streamError = parsed.data.detail || "生成失败";
+      }
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    const parsed = parseSseMessage(buffer);
+    if (parsed) {
+      if (parsed.event === "status") {
+        elements.chapterHint.textContent = parsed.data.message || "正在生成...";
+      } else if (parsed.event === "body_delta") {
+        elements.chapterBody.value += parsed.data.content || "";
+      } else if (parsed.event === "summary") {
+        elements.chapterSummary.value = parsed.data.summary || "";
+      } else if (parsed.event === "complete") {
+        result = parsed.data;
+      } else if (parsed.event === "error") {
+        streamError = parsed.data.detail || "生成失败";
+      }
+    }
+  }
+
+  setGenerationState(false);
+  if (streamError) {
+    throw new Error(streamError);
+  }
+  if (!result) {
+    throw new Error("流式生成未返回完成事件。");
+  }
+
   await loadProject(project.id);
   state.currentChapterId = result.chapter.id;
   renderChapterList();
@@ -508,6 +587,36 @@ async function generateChapter() {
   renderActiveChapter();
   const modelLabel = result.model === "local-fallback" ? "本地回退草稿" : result.model;
   elements.chapterHint.textContent = `生成完成，模型：${modelLabel}。自动加载角色 ${result.autoLoadedCharacterIds.length} 个，词条 ${result.autoLoadedEntryIds.length} 个。`;
+}
+
+function parseSseMessage(message) {
+  const lines = message.split("\n");
+  let event = "message";
+  const dataLines = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+  if (!dataLines.length) {
+    return null;
+  }
+  return {
+    event,
+    data: JSON.parse(dataLines.join("\n")),
+  };
+}
+
+function setGenerationState(isGenerating) {
+  elements.generateChapterBtn.disabled = isGenerating;
+  elements.regenerateChapterBtn.disabled = isGenerating;
+  elements.saveChapterBtn.disabled = isGenerating;
 }
 
 function bindEvents() {

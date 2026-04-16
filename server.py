@@ -16,6 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 DATA_FILE = DATA_DIR / "store.json"
 PUBLIC_DIR = ROOT_DIR / "public"
+DEFAULT_TIMEOUT_SECONDS = 60
 
 
 def now():
@@ -35,7 +36,6 @@ def ensure_data_file():
                             "apiKey": "",
                             "baseUrl": "https://api.openai.com/v1",
                             "model": "gpt-4.1-mini",
-                            "timeoutSeconds": 180,
                         }
                     },
                 },
@@ -56,10 +56,7 @@ def read_store():
             "apiKey": "",
             "baseUrl": "https://api.openai.com/v1",
             "model": "gpt-4.1-mini",
-            "timeoutSeconds": 180,
         }
-    elif "timeoutSeconds" not in store["settings"]["model"]:
-        store["settings"]["model"]["timeoutSeconds"] = 180
     return store
 
 
@@ -82,6 +79,20 @@ def summarize_text(text, max_length=320):
     if len(normalized) > max_length:
         return f"{normalized[:max_length]}..."
     return normalized
+
+
+def parse_json_text(text, context_label):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        snippet = summarize_text(text, 240) or "<empty response>"
+        raise RuntimeError(f"{context_label} returned non-JSON content: {snippet}") from error
+
+
+def stream_chunks(text, chunk_size=120):
+    normalized = str(text or "")
+    for start in range(0, len(normalized), chunk_size):
+        yield normalized[start : start + chunk_size]
 
 
 def unique_by_id(items):
@@ -205,6 +216,14 @@ def build_card_updates(chapter, payload, body, summary):
             for entry in payload["usedEntries"]
         ],
     }
+
+
+def fallback_finalize(chapter, payload, body):
+    summary = summarize_text(
+        f"{normalize_text(chapter.get('title')) or '本章'}：{summarize_text(body, 120) or normalize_text(chapter.get('plot')) or '生成完成。'}",
+        180,
+    )
+    return {"summary": summary, "cardUpdates": build_card_updates(chapter, payload, body, summary), "model": "local-fallback"}
 
 
 def fallback_generate(project, chapter, payload):
@@ -349,7 +368,8 @@ def call_model(project, chapter, payload):
 
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            raw_result = response.read().decode("utf-8", errors="replace")
+            result = parse_json_text(raw_result, "Model API")
     except HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Model API failed: {error.code} {detail}") from error
@@ -369,14 +389,235 @@ def call_model(project, chapter, payload):
     if not content:
         raise RuntimeError("Model API returned empty content.")
 
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as error:
-        snippet = summarize_text(content, 240)
-        raise RuntimeError(f"Model API returned non-JSON content: {snippet}") from error
+    parsed = parse_json_text(content, "Model content")
 
     return {
         "body": normalize_text(parsed.get("body")),
+        "summary": normalize_text(parsed.get("summary")),
+        "model": model,
+        "cardUpdates": {
+            "characterUpdates": [
+                {"id": str(item.get("id", "")), "relatedInfo": normalize_text(item.get("related_info"))}
+                for item in parsed.get("character_updates", [])
+            ],
+            "entryUpdates": [
+                {"id": str(item.get("id", "")), "relatedInfo": normalize_text(item.get("related_info"))}
+                for item in parsed.get("entry_updates", [])
+            ],
+        },
+    }
+
+
+def stream_model_body(project, chapter, payload, emit_body_delta):
+    store = read_store()
+    runtime_config = get_runtime_model_config(store)
+    api_key = runtime_config["apiKey"]
+    model = runtime_config["model"]
+    base_url = runtime_config["baseUrl"].rstrip("/")
+    timeout_seconds = runtime_config["timeoutSeconds"]
+
+    if not api_key:
+        fallback = fallback_generate(project, chapter, payload)
+        for chunk in stream_chunks(fallback["body"]):
+            emit_body_delta(chunk)
+        return {"body": fallback["body"], "model": fallback["model"], "cardUpdates": fallback["cardUpdates"], "summary": fallback["summary"]}
+
+    system_prompt = "\n".join(
+        [
+            "你是小说协作写作助手。",
+            "直接输出章节正文，不要输出标题，不要输出摘要，不要输出 JSON，不要输出 Markdown 代码块。",
+            "正文必须使用中文，目标长度 2500 到 3500 字。",
+            "重要设定只在必要处提及，避免解释腔和设定堆砌。",
+        ]
+    )
+    user_prompt = json.dumps(
+        {
+            "project": {
+                "title": project.get("title", ""),
+                "description": project.get("description", ""),
+                "world": project.get("world", {}),
+            },
+            "chapter": {
+                "id": chapter.get("id", ""),
+                "title": chapter.get("title", ""),
+                "plot": chapter.get("plot", ""),
+                "relationships": chapter.get("relationships", ""),
+                "styleGuide": chapter.get("styleGuide", ""),
+            },
+            "usedCharacters": [
+                {
+                    "id": item["id"],
+                    "name": item.get("name", ""),
+                    "gender": item.get("gender", ""),
+                    "personality": item.get("personality", ""),
+                    "relatedInfo": item.get("relatedInfo", ""),
+                }
+                for item in payload["usedCharacters"]
+            ],
+            "usedEntries": [
+                {"id": item["id"], "name": item.get("name", ""), "relatedInfo": item.get("relatedInfo", "")}
+                for item in payload["usedEntries"]
+            ],
+            "relatedContext": payload["relatedContext"],
+            "requirements": {
+                "outputLanguage": "zh-CN",
+                "bodyLength": "2500-3500 Chinese characters",
+                "regenerateReplacesBodyAndSummary": True,
+            },
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    payload_body = json.dumps(
+        {
+            "model": model,
+            "temperature": 0.9,
+            "max_tokens": 5000,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+    ).encode("utf-8")
+
+    request = Request(
+        f"{base_url}/chat/completions",
+        data=payload_body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+
+    body_parts = []
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            while True:
+                raw_line = response.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                event_data = line[5:].strip()
+                if event_data == "[DONE]":
+                    break
+                event = parse_json_text(event_data, "Model stream")
+                choice = event.get("choices", [{}])[0]
+                delta = choice.get("delta", {}).get("content")
+                if isinstance(delta, str) and delta:
+                    body_parts.append(delta)
+                    emit_body_delta(delta)
+                finish_reason = choice.get("finish_reason")
+                if finish_reason in {"stop", "length"}:
+                    break
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Model API failed: {error.code} {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"Model API unavailable: {error.reason}") from error
+    except socket.timeout as error:
+        raise RuntimeError(f"Model API timed out after {timeout_seconds}s.") from error
+
+    body = normalize_text("".join(body_parts))
+    if not body:
+        raise RuntimeError("Model API returned empty streamed content.")
+    return {"body": body, "model": model}
+
+
+def finalize_generated_chapter(project, chapter, payload, body, model):
+    store = read_store()
+    runtime_config = get_runtime_model_config(store)
+    api_key = runtime_config["apiKey"]
+    base_url = runtime_config["baseUrl"].rstrip("/")
+    timeout_seconds = runtime_config["timeoutSeconds"]
+
+    if not api_key:
+        return fallback_finalize(chapter, payload, body)
+
+    system_prompt = "\n".join(
+        [
+            "你是小说协作写作助手。",
+            "请严格输出 JSON，不要输出 Markdown 代码块。",
+            "JSON 结构必须是：",
+            '{"summary":"章节摘要","character_updates":[{"id":"角色ID","related_info":"角色相关信息"}],"entry_updates":[{"id":"词条ID","related_info":"词条相关信息"}]}',
+            "摘要使用中文，控制在 80 到 180 字。",
+            "角色和词条更新必须遵循最小必要更新原则，只更新动态信息，不要重写整个卡片。",
+        ]
+    )
+    user_prompt = json.dumps(
+        {
+            "project": {
+                "title": project.get("title", ""),
+                "description": project.get("description", ""),
+                "world": project.get("world", {}),
+            },
+            "chapter": {
+                "id": chapter.get("id", ""),
+                "title": chapter.get("title", ""),
+                "plot": chapter.get("plot", ""),
+                "relationships": chapter.get("relationships", ""),
+                "styleGuide": chapter.get("styleGuide", ""),
+                "body": body,
+            },
+            "usedCharacters": [
+                {
+                    "id": item["id"],
+                    "name": item.get("name", ""),
+                    "gender": item.get("gender", ""),
+                    "personality": item.get("personality", ""),
+                    "relatedInfo": item.get("relatedInfo", ""),
+                }
+                for item in payload["usedCharacters"]
+            ],
+            "usedEntries": [
+                {"id": item["id"], "name": item.get("name", ""), "relatedInfo": item.get("relatedInfo", "")}
+                for item in payload["usedEntries"]
+            ],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    payload_body = json.dumps(
+        {
+            "model": model,
+            "temperature": 0.4,
+            "max_tokens": 1200,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"{base_url}/chat/completions",
+        data=payload_body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            raw_result = response.read().decode("utf-8", errors="replace")
+            result = parse_json_text(raw_result, "Model API")
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        if detail:
+            return fallback_finalize(chapter, payload, body)
+        raise RuntimeError(f"Model API failed: {error.code} {detail}") from error
+    except URLError as error:
+        return fallback_finalize(chapter, payload, body)
+    except socket.timeout as error:
+        return fallback_finalize(chapter, payload, body)
+
+    content = result.get("choices", [{}])[0].get("message", {}).get("content")
+    if not content:
+        return fallback_finalize(chapter, payload, body)
+    try:
+        parsed = parse_json_text(content, "Model content")
+    except RuntimeError:
+        return fallback_finalize(chapter, payload, body)
+    return {
         "summary": normalize_text(parsed.get("summary")),
         "model": model,
         "cardUpdates": {
@@ -421,12 +662,7 @@ def get_runtime_model_config(store):
     api_key = normalize_text(saved.get("apiKey")) or normalize_text(os.environ.get("OPENAI_API_KEY"))
     base_url = normalize_text(saved.get("baseUrl")) or normalize_text(os.environ.get("OPENAI_BASE_URL")) or "https://api.openai.com/v1"
     model = normalize_text(saved.get("model")) or normalize_text(os.environ.get("OPENAI_MODEL")) or "gpt-4.1-mini"
-    timeout_raw = saved.get("timeoutSeconds", os.environ.get("OPENAI_TIMEOUT_SECONDS", 180))
-    try:
-        timeout_seconds = max(15, int(timeout_raw))
-    except (TypeError, ValueError):
-        timeout_seconds = 180
-    return {"apiKey": api_key, "baseUrl": base_url, "model": model, "timeoutSeconds": timeout_seconds}
+    return {"apiKey": api_key, "baseUrl": base_url, "model": model, "timeoutSeconds": DEFAULT_TIMEOUT_SECONDS}
 
 
 def get_config_response(store):
@@ -435,7 +671,6 @@ def get_config_response(store):
         "modelConfigured": bool(runtime_config["apiKey"]),
         "model": runtime_config["model"],
         "baseUrl": runtime_config["baseUrl"],
-        "timeoutSeconds": runtime_config["timeoutSeconds"],
         "hasSavedApiKey": bool(normalize_text(store.get("settings", {}).get("model", {}).get("apiKey"))),
     }
 
@@ -475,6 +710,22 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def begin_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def send_sse(self, event, payload):
+        data = json.dumps(payload, ensure_ascii=False)
+        message = f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+        self.wfile.write(message)
+        self.wfile.flush()
+
+    def finish_sse(self):
+        self.close_connection = True
 
     def send_bytes(self, status, body, content_type):
         self.send_response(status)
@@ -517,7 +768,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 {
                     "baseUrl": settings.get("baseUrl", "https://api.openai.com/v1"),
                     "model": settings.get("model", "gpt-4.1-mini"),
-                    "timeoutSeconds": settings.get("timeoutSeconds", 180),
                     "hasApiKey": bool(normalize_text(settings.get("apiKey"))),
                 },
             )
@@ -536,7 +786,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 "apiKey": api_key_value,
                 "baseUrl": normalize_text(body.get("baseUrl")) or existing.get("baseUrl") or "https://api.openai.com/v1",
                 "model": normalize_text(body.get("model")) or existing.get("model") or "gpt-4.1-mini",
-                "timeoutSeconds": max(15, int(body.get("timeoutSeconds") or existing.get("timeoutSeconds") or 180)),
             }
             write_store(store)
             self.send_json(200, get_config_response(store))
@@ -785,6 +1034,67 @@ class AppHandler(BaseHTTPRequestHandler):
                     "model": generated["model"],
                 },
             )
+            return
+
+        if self.command == "POST" and len(parts) == 6 and parts[3] == "chapters" and parts[5] == "generate-stream":
+            chapter = get_chapter(project, parts[4])
+            self.begin_sse()
+            if not chapter:
+                self.send_sse("error", {"detail": "Chapter not found"})
+                return
+
+            payload = build_generation_payload(project, chapter, chapter["id"])
+            self.send_sse("status", {"message": "正在生成正文..."})
+            try:
+                streamed = stream_model_body(project, chapter, payload, lambda chunk: self.send_sse("body_delta", {"content": chunk}))
+                self.send_sse("status", {"message": "正在整理摘要与卡片更新..."})
+                finalized = finalize_generated_chapter(project, chapter, payload, streamed["body"], streamed["model"])
+            except RuntimeError as error:
+                self.send_sse("error", {"detail": str(error)})
+                return
+
+            chapter["body"] = streamed["body"]
+            chapter["summary"] = finalized["summary"]
+            chapter["autoLoadedCharacterIds"] = payload["autoLoadedCharacterIds"]
+            chapter["autoLoadedEntryIds"] = payload["autoLoadedEntryIds"]
+            chapter["updatedAt"] = now()
+            project["updatedAt"] = now()
+            apply_card_updates(project, finalized["cardUpdates"])
+            project["generationLogs"].append(
+                {
+                    "id": next_id(store),
+                    "chapterId": chapter["id"],
+                    "createdAt": now(),
+                    "input": {
+                        "title": chapter["title"],
+                        "plot": chapter["plot"],
+                        "relationships": chapter["relationships"],
+                        "styleGuide": chapter["styleGuide"],
+                        "selectedCharacterIds": chapter["selectedCharacterIds"],
+                        "selectedEntryIds": chapter["selectedEntryIds"],
+                        "relatedChapters": chapter["relatedChapters"],
+                    },
+                    "output": {
+                        "body": chapter["body"],
+                        "summary": chapter["summary"],
+                        "autoLoadedCharacterIds": chapter["autoLoadedCharacterIds"],
+                        "autoLoadedEntryIds": chapter["autoLoadedEntryIds"],
+                        "model": finalized["model"],
+                    },
+                }
+            )
+            write_store(store)
+            self.send_sse("summary", {"summary": chapter["summary"]})
+            self.send_sse(
+                "complete",
+                {
+                    "chapter": chapter,
+                    "autoLoadedCharacterIds": chapter["autoLoadedCharacterIds"],
+                    "autoLoadedEntryIds": chapter["autoLoadedEntryIds"],
+                    "model": finalized["model"],
+                },
+            )
+            self.finish_sse()
             return
 
         self.not_found()

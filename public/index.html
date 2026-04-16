@@ -38,12 +38,10 @@
           <input id="model-base-url" placeholder="https://api.openai.com/v1" />
           <label>模型名称</label>
           <input id="model-name" placeholder="gpt-4.1-mini" />
-          <label>超时秒数</label>
-          <input id="model-timeout-seconds" type="number" min="15" step="15" placeholder="180" />
           <label>API Token</label>
           <input id="model-api-key" type="password" placeholder="输入 OpenAI 兼容接口 Token" />
           <p id="model-settings-hint" class="muted">
-            Token 只保存在本地 `data/store.json`，状态栏不会回显明文。超时默认 180 秒。
+            Token 只保存在本地 `data/store.json`，状态栏不会回显明文。请求超时固定为 60 秒。
           </p>
         </section>
       </aside>
