@@ -21,9 +21,6 @@ const elements = {
   modelSettingsHint: document.querySelector("#model-settings-hint"),
   saveModelSettingsBtn: document.querySelector("#save-model-settings-btn"),
   workspace: document.querySelector("#workspace"),
-  worldSetting: document.querySelector("#world-setting"),
-  worldCoreSetting: document.querySelector("#world-core-setting"),
-  saveWorldBtn: document.querySelector("#save-world-btn"),
   chapterList: document.querySelector("#chapter-list"),
   newChapterBtn: document.querySelector("#new-chapter-btn"),
   chapterEditor: document.querySelector("#chapter-editor"),
@@ -39,6 +36,12 @@ const elements = {
   chapterSummary: document.querySelector("#chapter-summary"),
   chapterHint: document.querySelector("#chapter-hint"),
   saveChapterBtn: document.querySelector("#save-chapter-btn"),
+  editPromptBtn: document.querySelector("#edit-prompt-btn"),
+  promptEditorPanel: document.querySelector("#prompt-editor-panel"),
+  systemPrompt: document.querySelector("#system-prompt"),
+  userPrompt: document.querySelector("#user-prompt"),
+  savePromptBtn: document.querySelector("#save-prompt-btn"),
+  promptEditorHint: document.querySelector("#prompt-editor-hint"),
   generateChapterBtn: document.querySelector("#generate-chapter-btn"),
   regenerateChapterBtn: document.querySelector("#regenerate-chapter-btn"),
   characterId: document.querySelector("#character-id"),
@@ -126,8 +129,6 @@ function renderProjectDetail() {
   elements.workspace.classList.remove("hidden");
   elements.projectTitle.textContent = project.title;
   elements.projectDescription.textContent = project.description || "未填写作品简介";
-  elements.worldSetting.value = project.world.setting || "";
-  elements.worldCoreSetting.value = project.world.coreSetting || "";
   renderChapterList();
   renderCharacterList();
   renderEntryList();
@@ -278,6 +279,9 @@ function renderActiveChapter() {
   elements.chapterStyleGuide.value = chapter.styleGuide || "";
   elements.chapterBody.value = chapter.body || "";
   elements.chapterSummary.value = chapter.summary || "";
+  elements.systemPrompt.value = "";
+  elements.userPrompt.value = "";
+  elements.promptEditorHint.textContent = "System Prompt 全局生效；User Prompt 只影响当前章节。";
 
   const autoCharacters = chapter.autoLoadedCharacterIds?.length
     ? `自动加载角色：${chapter.autoLoadedCharacterIds.length} 个`
@@ -383,21 +387,6 @@ async function createProject() {
   await refreshProjects(project.id);
 }
 
-async function saveWorld() {
-  const project = selectedProject();
-  if (!project) {
-    return;
-  }
-  await api(`/api/projects/${project.id}/world`, {
-    method: "PUT",
-    body: JSON.stringify({
-      setting: elements.worldSetting.value,
-      coreSetting: elements.worldCoreSetting.value,
-    }),
-  });
-  await loadProject(project.id);
-}
-
 async function saveCharacter() {
   const project = selectedProject();
   if (!project) {
@@ -495,6 +484,48 @@ async function saveChapter() {
   renderChapterList();
   renderChapterSelectors();
   renderActiveChapter();
+}
+
+async function loadGenerationPrompt() {
+  const project = selectedProject();
+  const chapter = selectedChapter();
+  if (!project || !chapter) {
+    return;
+  }
+
+  await saveChapter();
+  const prompt = await api(`/api/projects/${project.id}/chapters/${chapter.id}/generation-prompt`);
+  elements.systemPrompt.value = prompt.systemPrompt || "";
+  elements.userPrompt.value = prompt.userPrompt || "";
+  elements.promptEditorPanel.open = true;
+  elements.promptEditorHint.textContent = "已加载即将用于正文生成的 Prompt。";
+}
+
+async function saveGenerationPrompt() {
+  const project = selectedProject();
+  const chapter = selectedChapter();
+  if (!project || !chapter) {
+    return;
+  }
+
+  const prompt = await api(`/api/projects/${project.id}/chapters/${chapter.id}/generation-prompt`, {
+    method: "PUT",
+    body: JSON.stringify({
+      systemPrompt: elements.systemPrompt.value,
+      userPrompt: elements.userPrompt.value,
+    }),
+  });
+  elements.systemPrompt.value = prompt.systemPrompt || "";
+  elements.userPrompt.value = prompt.userPrompt || "";
+  await loadProject(project.id);
+  state.currentChapterId = chapter.id;
+  renderChapterList();
+  renderChapterSelectors();
+  renderActiveChapter();
+  elements.promptEditorPanel.open = true;
+  elements.systemPrompt.value = prompt.systemPrompt || "";
+  elements.userPrompt.value = prompt.userPrompt || "";
+  elements.promptEditorHint.textContent = "Prompt 已保存。System Prompt 全局生效，User Prompt 仅当前章节生效。";
 }
 
 async function generateChapter() {
@@ -617,17 +648,20 @@ function setGenerationState(isGenerating) {
   elements.generateChapterBtn.disabled = isGenerating;
   elements.regenerateChapterBtn.disabled = isGenerating;
   elements.saveChapterBtn.disabled = isGenerating;
+  elements.editPromptBtn.disabled = isGenerating;
+  elements.savePromptBtn.disabled = isGenerating;
 }
 
 function bindEvents() {
   elements.newProjectBtn.addEventListener("click", () => createProject().catch(handleError));
   elements.toggleSidebarBtn.addEventListener("click", toggleSidebar);
   elements.saveModelSettingsBtn.addEventListener("click", () => saveModelSettings().catch(handleError));
-  elements.saveWorldBtn.addEventListener("click", () => saveWorld().catch(handleError));
   elements.saveCharacterBtn.addEventListener("click", () => saveCharacter().catch(handleError));
   elements.saveEntryBtn.addEventListener("click", () => saveEntry().catch(handleError));
   elements.newChapterBtn.addEventListener("click", () => createChapter().catch(handleError));
   elements.saveChapterBtn.addEventListener("click", () => saveChapter().catch(handleError));
+  elements.editPromptBtn.addEventListener("click", () => loadGenerationPrompt().catch(handleError));
+  elements.savePromptBtn.addEventListener("click", () => saveGenerationPrompt().catch(handleError));
   elements.generateChapterBtn.addEventListener("click", () => generateChapter().catch(handleError));
   elements.regenerateChapterBtn.addEventListener("click", () => generateChapter().catch(handleError));
 }

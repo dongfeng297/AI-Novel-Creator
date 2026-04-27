@@ -17,6 +17,14 @@ DATA_DIR = ROOT_DIR / "data"
 DATA_FILE = DATA_DIR / "store.json"
 PUBLIC_DIR = ROOT_DIR / "public"
 DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_BODY_SYSTEM_PROMPT = "\n".join(
+    [
+        "你是小说协作写作助手。",
+        "直接输出章节正文，不要输出标题，不要输出摘要，不要输出 JSON，不要输出 Markdown 代码块。",
+        "正文必须使用中文，目标长度 2500 到 3500 字。",
+        "重要设定只在必要处提及，避免解释腔和设定堆砌。",
+    ]
+)
 
 
 def now():
@@ -57,6 +65,8 @@ def read_store():
             "baseUrl": "https://api.openai.com/v1",
             "model": "gpt-4.1-mini",
         }
+    if "prompts" not in store["settings"]:
+        store["settings"]["prompts"] = {}
     return store
 
 
@@ -191,6 +201,96 @@ def build_generation_payload(project, chapter, chapter_id):
     }
 
 
+def build_body_user_prompt(project, chapter, payload):
+    return json.dumps(
+        {
+            "chapter": {
+                "id": chapter.get("id", ""),
+                "title": chapter.get("title", ""),
+                "plot": chapter.get("plot", ""),
+                "relationships": chapter.get("relationships", ""),
+                "styleGuide": chapter.get("styleGuide", ""),
+            },
+            "usedCharacters": [
+                {
+                    "id": item["id"],
+                    "name": item.get("name", ""),
+                    "gender": item.get("gender", ""),
+                    "personality": item.get("personality", ""),
+                    "relatedInfo": item.get("relatedInfo", ""),
+                }
+                for item in payload["usedCharacters"]
+            ],
+            "usedEntries": [
+                {"id": item["id"], "name": item.get("name", ""), "relatedInfo": item.get("relatedInfo", "")}
+                for item in payload["usedEntries"]
+            ],
+            "relatedContext": payload["relatedContext"],
+            "requirements": {
+                "outputLanguage": "zh-CN",
+                "bodyLength": "2500-3500 Chinese characters",
+                "regenerateReplacesBodyAndSummary": True,
+            },
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def get_body_system_prompt(store):
+    return normalize_text(store.get("settings", {}).get("prompts", {}).get("chapterBodySystemPrompt")) or DEFAULT_BODY_SYSTEM_PROMPT
+
+
+def build_body_prompt(project, chapter, payload, store):
+    signature = build_body_prompt_source_signature(project, chapter, payload)
+    saved_user_prompt = normalize_text(chapter.get("bodyUserPrompt"))
+    if chapter.get("bodyUserPromptSourceSignature") != signature:
+        saved_user_prompt = ""
+    return {
+        "systemPrompt": get_body_system_prompt(store),
+        "userPrompt": saved_user_prompt or build_body_user_prompt(project, chapter, payload),
+    }
+
+
+def build_body_prompt_source_signature(project, chapter, payload):
+    source = {
+        "chapter": {
+            "id": chapter.get("id", ""),
+            "title": chapter.get("title", ""),
+            "plot": chapter.get("plot", ""),
+            "relationships": chapter.get("relationships", ""),
+            "styleGuide": chapter.get("styleGuide", ""),
+            "selectedCharacterIds": chapter.get("selectedCharacterIds", []),
+            "selectedEntryIds": chapter.get("selectedEntryIds", []),
+            "relatedChapters": chapter.get("relatedChapters", []),
+        },
+        "usedCharacters": [
+            {
+                "id": item["id"],
+                "name": item.get("name", ""),
+                "gender": item.get("gender", ""),
+                "personality": item.get("personality", ""),
+                "relatedInfo": item.get("relatedInfo", ""),
+            }
+            for item in payload["usedCharacters"]
+        ],
+        "usedEntries": [
+            {"id": item["id"], "name": item.get("name", ""), "relatedInfo": item.get("relatedInfo", "")}
+            for item in payload["usedEntries"]
+        ],
+        "relatedContext": payload["relatedContext"],
+    }
+    return json.dumps(source, ensure_ascii=False, sort_keys=True)
+
+
+def refresh_chapter_user_prompt_if_source_changed(project, chapter):
+    payload = build_generation_payload(project, chapter, chapter["id"])
+    signature = build_body_prompt_source_signature(project, chapter, payload)
+    if chapter.get("bodyUserPromptSourceSignature") != signature:
+        chapter["bodyUserPrompt"] = build_body_user_prompt(project, chapter, payload)
+        chapter["bodyUserPromptSourceSignature"] = signature
+
+
 def build_card_updates(chapter, payload, body, summary):
     body_summary = summarize_text(body, 180)
     change_hint = summarize_text(chapter.get("plot") or summary, 180)
@@ -229,7 +329,6 @@ def fallback_finalize(chapter, payload, body):
 def fallback_generate(project, chapter, payload):
     title = normalize_text(chapter.get("title")) or "未命名章节"
     style = normalize_text(chapter.get("styleGuide")) or "自然、连贯的中文小说风格"
-    world = normalize_text(project["world"].get("coreSetting") or project["world"].get("setting"))
     character_line = (
         f"本章涉及角色：{'、'.join(item['name'] for item in payload['usedCharacters'])}。"
         if payload["usedCharacters"]
@@ -256,7 +355,6 @@ def fallback_generate(project, chapter, payload):
             f"《{title}》",
             "",
             f"写作风格要求：{style}",
-            f"世界观重点：{world}" if world else "",
             character_line,
             entry_line,
             relationship_line,
@@ -309,11 +407,6 @@ def call_model(project, chapter, payload):
 
     user_prompt = json.dumps(
         {
-            "project": {
-                "title": project.get("title", ""),
-                "description": project.get("description", ""),
-                "world": project.get("world", {}),
-            },
             "chapter": {
                 "id": chapter.get("id", ""),
                 "title": chapter.get("title", ""),
@@ -422,52 +515,7 @@ def stream_model_body(project, chapter, payload, emit_body_delta):
             emit_body_delta(chunk)
         return {"body": fallback["body"], "model": fallback["model"], "cardUpdates": fallback["cardUpdates"], "summary": fallback["summary"]}
 
-    system_prompt = "\n".join(
-        [
-            "你是小说协作写作助手。",
-            "直接输出章节正文，不要输出标题，不要输出摘要，不要输出 JSON，不要输出 Markdown 代码块。",
-            "正文必须使用中文，目标长度 2500 到 3500 字。",
-            "重要设定只在必要处提及，避免解释腔和设定堆砌。",
-        ]
-    )
-    user_prompt = json.dumps(
-        {
-            "project": {
-                "title": project.get("title", ""),
-                "description": project.get("description", ""),
-                "world": project.get("world", {}),
-            },
-            "chapter": {
-                "id": chapter.get("id", ""),
-                "title": chapter.get("title", ""),
-                "plot": chapter.get("plot", ""),
-                "relationships": chapter.get("relationships", ""),
-                "styleGuide": chapter.get("styleGuide", ""),
-            },
-            "usedCharacters": [
-                {
-                    "id": item["id"],
-                    "name": item.get("name", ""),
-                    "gender": item.get("gender", ""),
-                    "personality": item.get("personality", ""),
-                    "relatedInfo": item.get("relatedInfo", ""),
-                }
-                for item in payload["usedCharacters"]
-            ],
-            "usedEntries": [
-                {"id": item["id"], "name": item.get("name", ""), "relatedInfo": item.get("relatedInfo", "")}
-                for item in payload["usedEntries"]
-            ],
-            "relatedContext": payload["relatedContext"],
-            "requirements": {
-                "outputLanguage": "zh-CN",
-                "bodyLength": "2500-3500 Chinese characters",
-                "regenerateReplacesBodyAndSummary": True,
-            },
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    prompts = build_body_prompt(project, chapter, payload, store)
 
     payload_body = json.dumps(
         {
@@ -476,8 +524,8 @@ def stream_model_body(project, chapter, payload, emit_body_delta):
             "max_tokens": 5000,
             "stream": True,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": prompts["systemPrompt"]},
+                {"role": "user", "content": prompts["userPrompt"]},
             ],
         }
     ).encode("utf-8")
@@ -547,11 +595,6 @@ def finalize_generated_chapter(project, chapter, payload, body, model):
     )
     user_prompt = json.dumps(
         {
-            "project": {
-                "title": project.get("title", ""),
-                "description": project.get("description", ""),
-                "world": project.get("world", {}),
-            },
             "chapter": {
                 "id": chapter.get("id", ""),
                 "title": chapter.get("title", ""),
@@ -651,6 +694,7 @@ def apply_card_updates(project, updates):
 
 def sanitize_project(project):
     sanitized = dict(project)
+    sanitized.pop("world", None)
     sanitized["chapters"] = sorted(project["chapters"], key=lambda item: item["order"])
     sanitized["characters"] = sorted(project["characters"], key=lambda item: item.get("name", ""))
     sanitized["entries"] = sorted(project["entries"], key=lambda item: item.get("name", ""))
@@ -815,7 +859,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 "description": normalize_text(body.get("description")),
                 "createdAt": now(),
                 "updatedAt": now(),
-                "world": {"setting": "", "coreSetting": "", "updatedAt": now()},
                 "characters": [],
                 "entries": [],
                 "chapters": [],
@@ -846,18 +889,6 @@ class AppHandler(BaseHTTPRequestHandler):
             project["updatedAt"] = now()
             write_store(store)
             self.send_json(200, sanitize_project(project))
-            return
-
-        if self.command == "PUT" and len(parts) == 4 and parts[3] == "world":
-            body = self.read_json_body()
-            project["world"] = {
-                "setting": normalize_text(body.get("setting")),
-                "coreSetting": normalize_text(body.get("coreSetting")),
-                "updatedAt": now(),
-            }
-            project["updatedAt"] = now()
-            write_store(store)
-            self.send_json(200, project["world"])
             return
 
         if self.command == "POST" and len(parts) == 4 and parts[3] == "characters":
@@ -939,6 +970,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 "autoLoadedCharacterIds": [],
                 "autoLoadedEntryIds": [],
                 "relatedChapters": default_related_chapters(project, chapter_id),
+                "bodyUserPrompt": "",
+                "bodyUserPromptSourceSignature": "",
                 "updatedAt": now(),
                 "createdAt": now(),
             }
@@ -976,10 +1009,41 @@ class AppHandler(BaseHTTPRequestHandler):
                     for item in body["relatedChapters"]
                     if item and item.get("chapterId")
                 ]
+            refresh_chapter_user_prompt_if_source_changed(project, chapter)
             chapter["updatedAt"] = now()
             project["updatedAt"] = now()
             write_store(store)
             self.send_json(200, chapter)
+            return
+
+        if self.command == "GET" and len(parts) == 6 and parts[3] == "chapters" and parts[5] == "generation-prompt":
+            chapter = get_chapter(project, parts[4])
+            if not chapter:
+                self.not_found()
+                return
+            payload = build_generation_payload(project, chapter, chapter["id"])
+            self.send_json(200, build_body_prompt(project, chapter, payload, store))
+            return
+
+        if self.command == "PUT" and len(parts) == 6 and parts[3] == "chapters" and parts[5] == "generation-prompt":
+            chapter = get_chapter(project, parts[4])
+            if not chapter:
+                self.not_found()
+                return
+            body = self.read_json_body()
+            system_prompt = normalize_text(body.get("systemPrompt"))
+            user_prompt = normalize_text(body.get("userPrompt"))
+            payload = build_generation_payload(project, chapter, chapter["id"])
+            signature = build_body_prompt_source_signature(project, chapter, payload)
+            store.setdefault("settings", {}).setdefault("prompts", {})["chapterBodySystemPrompt"] = (
+                system_prompt or DEFAULT_BODY_SYSTEM_PROMPT
+            )
+            chapter["bodyUserPrompt"] = user_prompt or build_body_user_prompt(project, chapter, payload)
+            chapter["bodyUserPromptSourceSignature"] = signature
+            chapter["updatedAt"] = now()
+            project["updatedAt"] = now()
+            write_store(store)
+            self.send_json(200, build_body_prompt(project, chapter, payload, store))
             return
 
         if self.command == "POST" and len(parts) == 6 and parts[3] == "chapters" and parts[5] == "generate":

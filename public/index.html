@@ -101,9 +101,26 @@
                 </div>
                 <div class="actions">
                   <button id="save-chapter-btn" class="secondary">保存章节</button>
+                  <button id="edit-prompt-btn" class="secondary">编辑 Prompt</button>
                   <button id="regenerate-chapter-btn">重新生成</button>
                 </div>
               </section>
+
+              <details id="prompt-editor-panel" class="panel column-panel accordion-panel">
+                <summary>Prompt 编辑</summary>
+                <div class="accordion-body">
+                  <label>System Prompt</label>
+                  <textarea id="system-prompt" rows="7" placeholder="正文生成的全局 System Prompt"></textarea>
+
+                  <label>User Prompt</label>
+                  <textarea id="user-prompt" rows="12" placeholder="当前章节的 User Prompt"></textarea>
+
+                  <div class="actions">
+                    <button id="save-prompt-btn">保存 Prompt</button>
+                  </div>
+                  <p id="prompt-editor-hint" class="muted">System Prompt 全局生效；User Prompt 只影响当前章节。</p>
+                </div>
+              </details>
 
               <details class="panel column-panel accordion-panel" open>
                 <summary>生成配置</summary>
@@ -137,20 +154,6 @@
                 <summary>关联历史章节</summary>
                 <div class="accordion-body">
                   <div id="chapter-related-selector" class="checkbox-list related-list sidebar-selector"></div>
-                </div>
-              </details>
-
-              <details class="panel column-panel accordion-panel">
-                <summary>世界观</summary>
-                <div class="accordion-body">
-                  <div class="panel-head inline-head">
-                    <span></span>
-                    <button id="save-world-btn">保存世界观</button>
-                  </div>
-                  <label>世界设定</label>
-                  <textarea id="world-setting" rows="5" placeholder="世界设定"></textarea>
-                  <label>核心设定</label>
-                  <textarea id="world-core-setting" rows="4" placeholder="核心设定"></textarea>
                 </div>
               </details>
 
